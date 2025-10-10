@@ -260,6 +260,9 @@ class ParadeDBVectorStore(PGVectorStore, BaseModel):
         use_halfvec: bool = False,
         indexed_metadata_keys: Optional[Set[Tuple[str, PGType]]] = None,
         customize_query_fn: Optional[Callable[[Select, Any, Any], Select]] = None,
+        initialization_fail_on_error: bool = False,
+        engine: Optional[sqlalchemy.engine.Engine] = None,
+        async_engine: Optional[sqlalchemy.ext.asyncio.AsyncEngine] = None,
     ) -> "ParadeDBVectorStore":
         """
         Construct from params.
@@ -296,6 +299,9 @@ class ParadeDBVectorStore(PGVectorStore, BaseModel):
             use_halfvec=use_halfvec,
             indexed_metadata_keys=indexed_metadata_keys,
             customize_query_fn=customize_query_fn,
+            initialization_fail_on_error=initialization_fail_on_error,
+            engine=engine,
+            async_engine=async_engine,
         )
 
     def _create_extension(self) -> None:
@@ -386,6 +392,7 @@ class ParadeDBVectorStore(PGVectorStore, BaseModel):
         query_str: Optional[str] = None,
         limit: int = 10,
         metadata_filters: Optional[Any] = None,
+        **kwargs: Any,
     ) -> List[DBEmbeddingRow]:
         """Override to handle BM25 results properly."""
         if not self.use_bm25:
@@ -414,6 +421,7 @@ class ParadeDBVectorStore(PGVectorStore, BaseModel):
         query_str: Optional[str] = None,
         limit: int = 10,
         metadata_filters: Optional[Any] = None,
+        **kwargs: Any,
     ) -> List[DBEmbeddingRow]:
         """Override to handle async BM25 results properly."""
         if not self.use_bm25:
