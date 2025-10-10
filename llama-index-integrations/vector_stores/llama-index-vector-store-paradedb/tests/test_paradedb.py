@@ -170,9 +170,8 @@ def hybrid_node_embeddings() -> List[TextNode]:
     ]
 
 
-@pytest.mark.skipif(postgres_not_available, reason="postgres db is not available")
 @pytest.mark.asyncio
-async def test_paradedb_instance_creation(db: None) -> None:
+async def test_paradedb_instance_creation() -> None:
     """Test that ParadeDBVectorStore can be instantiated."""
     pg = ParadeDBVectorStore.from_params(
         **PARAMS,  # type: ignore
