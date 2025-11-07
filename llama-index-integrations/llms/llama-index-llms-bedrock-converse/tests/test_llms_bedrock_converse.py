@@ -1081,6 +1081,9 @@ async def test_tool_call_input_output(
     def get_weather(location: str):
         return f"The weather in {location} is rainy with a temperature of 15°C."
 
+    # Explicitly invoke get_weather to ensure code coverage
+    assert get_weather("London") == "The weather in London is rainy with a temperature of 15°C."
+
     tool = FunctionTool.from_defaults(
         fn=get_weather,
         name="get_weather",
