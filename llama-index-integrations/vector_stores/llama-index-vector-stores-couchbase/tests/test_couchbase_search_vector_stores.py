@@ -217,6 +217,194 @@ def node_embeddings() -> list[TextNode]:
     ]
 
 
+MOCK_BUCKET_NAME = "mock_bucket"
+MOCK_SCOPE_NAME = "mock_scope"
+MOCK_COLLECTION_NAME = "mock_collection"
+MOCK_INDEX_NAME = "mock_index"
+
+
+class _MockCouchbaseBackend:
+    """In-memory stand-in for a Couchbase cluster used by the unit tests."""
+
+    def __init__(self) -> None:
+        from unittest.mock import MagicMock
+
+        self.documents = {}
+
+        self.cluster = MagicMock(spec=Cluster)
+        self.bucket = MagicMock()
+        self.scope = MagicMock()
+        self.collection = MagicMock()
+
+        self.cluster.bucket.return_value = self.bucket
+        self.bucket.scope.return_value = self.scope
+        self.scope.collection.return_value = self.collection
+
+        collection_spec = MagicMock()
+        collection_spec.name = MOCK_COLLECTION_NAME
+        scope_spec = MagicMock()
+        scope_spec.name = MOCK_SCOPE_NAME
+        scope_spec.collections = [collection_spec]
+        self.bucket.collections.return_value.get_all_scopes.return_value = [
+            scope_spec
+        ]
+
+        index_spec = MagicMock()
+        index_spec.name = MOCK_INDEX_NAME
+        self.scope.search_indexes.return_value.get_all_indexes.return_value = [
+            index_spec
+        ]
+        self.cluster.search_indexes.return_value.get_all_indexes.return_value = [
+            index_spec
+        ]
+
+        self.collection.upsert_multi.side_effect = self._upsert_multi
+        self.scope.search.side_effect = self._search
+        self.cluster.search.side_effect = self._search
+
+    def _upsert_multi(self, docs, *args, **kwargs):
+        from unittest.mock import MagicMock
+
+        self.documents.update(docs)
+        result = MagicMock()
+        result.all_ok = True
+        result.exceptions = {}
+        return result
+
+    def _search(self, *args, **kwargs):
+        from unittest.mock import MagicMock
+
+        rows = []
+        for doc_id, doc in self.documents.items():
+            fields = {"text": doc.get("text", "")}
+            for key, value in (doc.get("metadata") or {}).items():
+                fields[f"metadata.{key}"] = value
+            row = MagicMock()
+            row.id = doc_id
+            row.score = 0.9
+            row.fields = fields
+            rows.append(row)
+
+        search_result = MagicMock()
+        search_result.rows.return_value = rows
+        search_result.__iter__.return_value = iter(rows)
+        return search_result
+
+
+def _mock_nodes() -> list:
+    return [
+        TextNode(
+            text="foo",
+            id_="mock-node-1",
+            metadata={"genre": "Fiction", "pages": 10},
+            embedding=text_to_embedding("foo"),
+        ),
+        TextNode(
+            text="bar",
+            id_="mock-node-2",
+            metadata={"genre": "Mystery", "pages": 20},
+            embedding=text_to_embedding("bar"),
+        ),
+    ]
+
+
+class TestCouchbaseSearchVectorStoreWithMocks:
+    @pytest.fixture()
+    def backend(self) -> _MockCouchbaseBackend:
+        return _MockCouchbaseBackend()
+
+    @pytest.fixture()
+    def mock_vector_store(
+        self, backend: _MockCouchbaseBackend
+    ) -> CouchbaseSearchVectorStore:
+        return CouchbaseSearchVectorStore(
+            cluster=backend.cluster,
+            bucket_name=MOCK_BUCKET_NAME,
+            scope_name=MOCK_SCOPE_NAME,
+            collection_name=MOCK_COLLECTION_NAME,
+            index_name=MOCK_INDEX_NAME,
+        )
+
+    def test_invalid_cluster_raises(self) -> None:
+        with pytest.raises(Exception):
+            CouchbaseSearchVectorStore(
+                cluster="not-a-cluster",
+                bucket_name=MOCK_BUCKET_NAME,
+                scope_name=MOCK_SCOPE_NAME,
+                collection_name=MOCK_COLLECTION_NAME,
+                index_name=MOCK_INDEX_NAME,
+            )
+
+    def test_add(
+        self,
+        backend: _MockCouchbaseBackend,
+        mock_vector_store: CouchbaseSearchVectorStore,
+    ) -> None:
+        nodes = _mock_nodes()
+        ids = mock_vector_store.add(nodes)
+
+        assert backend.collection.upsert_multi.called
+        assert sorted(ids) == sorted(node.node_id for node in nodes)
+        assert set(backend.documents.keys()) == {node.node_id for node in nodes}
+
+    def test_query(
+        self,
+        backend: _MockCouchbaseBackend,
+        mock_vector_store: CouchbaseSearchVectorStore,
+    ) -> None:
+        mock_vector_store.add(_mock_nodes())
+
+        result = mock_vector_store.query(
+            VectorStoreQuery(
+                query_embedding=text_to_embedding("foo"), similarity_top_k=2
+            )
+        )
+
+        assert backend.scope.search.called or backend.cluster.search.called
+        assert result.nodes is not None
+        assert len(result.nodes) == 2
+
+    def test_query_with_filter(
+        self,
+        backend: _MockCouchbaseBackend,
+        mock_vector_store: CouchbaseSearchVectorStore,
+    ) -> None:
+        from llama_index.core.vector_stores.types import (
+            MetadataFilter,
+            MetadataFilters,
+        )
+
+        mock_vector_store.add(_mock_nodes())
+
+        filters = MetadataFilters(
+            filters=[MetadataFilter(key="genre", value="Fiction")]
+        )
+        mock_vector_store.query(
+            VectorStoreQuery(
+                query_embedding=text_to_embedding("foo"),
+                similarity_top_k=1,
+                filters=filters,
+            )
+        )
+
+        assert backend.scope.search.called or backend.cluster.search.called
+
+    def test_delete(
+        self,
+        backend: _MockCouchbaseBackend,
+        mock_vector_store: CouchbaseSearchVectorStore,
+    ) -> None:
+        mock_vector_store.add(_mock_nodes())
+        mock_vector_store.delete("mock-ref-doc")
+
+        assert (
+            backend.scope.query.called
+            or backend.cluster.query.called
+            or backend.collection.remove.called
+            or backend.collection.remove_multi.called
+        )
+
+
 @pytest.mark.skipif(
     not set_all_env_vars(), reason="missing Couchbase environment variables"
 )

@@ -261,6 +261,142 @@ def drop_vector_index(
         pass
 
 
+MOCK_BUCKET_NAME = "mock_bucket"
+MOCK_SCOPE_NAME = "mock_scope"
+MOCK_COLLECTION_NAME = "mock_collection"
+
+
+def _build_mock_cluster():
+    """Build a mocked Couchbase cluster exposing a bucket, scope and collection."""
+    from unittest.mock import MagicMock
+
+    from couchbase.cluster import Cluster
+
+    cluster = MagicMock(spec=Cluster)
+
+    bucket_info = MagicMock()
+    bucket_info.name = MOCK_BUCKET_NAME
+    cluster.buckets.return_value.get_all_buckets.return_value = [bucket_info]
+    cluster.buckets.return_value.get_bucket.return_value = bucket_info
+
+    collection_info = MagicMock()
+    collection_info.name = MOCK_COLLECTION_NAME
+    scope_info = MagicMock()
+    scope_info.name = MOCK_SCOPE_NAME
+    scope_info.collections = [collection_info]
+
+    bucket = cluster.bucket.return_value
+    bucket.collections.return_value.get_all_scopes.return_value = [scope_info]
+    return cluster
+
+
+def _build_mock_vector_store(cluster, monkeypatch, search_type=None, similarity=None):
+    """Create a CouchbaseQueryVectorStore backed by a mocked cluster."""
+    from llama_index.vector_stores.couchbase import base as cb_base
+
+    store_cls = cb_base.CouchbaseQueryVectorStore
+    # Existence checks would need a live server; make them pass.
+    for attr in dir(store_cls):
+        if attr.startswith("_check_"):
+            monkeypatch.setattr(store_cls, attr, lambda *args, **kwargs: True)
+
+    if search_type is None:
+        search_type = list(cb_base.QueryVectorSearchType)[0]
+    if similarity is None:
+        similarity = list(cb_base.QueryVectorSearchSimilarity)[0]
+
+    return store_cls(
+        cluster=cluster,
+        bucket_name=MOCK_BUCKET_NAME,
+        scope_name=MOCK_SCOPE_NAME,
+        collection_name=MOCK_COLLECTION_NAME,
+        search_type=search_type,
+        similarity=similarity,
+    )
+
+
+class TestCouchbaseQueryVectorStoreMocked:
+    """Unit tests for CouchbaseQueryVectorStore that run without a Couchbase server."""
+
+    @pytest.fixture()
+    def mock_cluster(self):
+        return _build_mock_cluster()
+
+    @pytest.fixture()
+    def vector_store(self, mock_cluster, monkeypatch):
+        return _build_mock_vector_store(mock_cluster, monkeypatch)
+
+    def test_initialization(self, vector_store, mock_cluster) -> None:
+        assert vector_store is not None
+        assert mock_cluster.bucket.called
+
+    def test_initialization_with_string_search_type(
+        self, mock_cluster, monkeypatch
+    ) -> None:
+        from llama_index.vector_stores.couchbase import base as cb_base
+
+        search_type = list(cb_base.QueryVectorSearchType)[0]
+        store = _build_mock_vector_store(
+            mock_cluster, monkeypatch, search_type=search_type.value
+        )
+        assert store is not None
+
+    def test_add_nodes(self, vector_store) -> None:
+        from llama_index.core.schema import TextNode
+
+        nodes = [
+            TextNode(
+                text=f"mock text {i}",
+                id_=f"mock-node-{i}",
+                embedding=[0.1 * (i + 1), 0.2, 0.3],
+                metadata={"category": "a", "rating": i},
+            )
+            for i in range(3)
+        ]
+        ids = vector_store.add(nodes)
+        assert isinstance(ids, list)
+
+    def test_query(self, vector_store, mock_cluster) -> None:
+        from llama_index.core.vector_stores.types import (
+            VectorStoreQuery,
+            VectorStoreQueryResult,
+        )
+
+        result = vector_store.query(
+            VectorStoreQuery(query_embedding=[0.1, 0.2, 0.3], similarity_top_k=2)
+        )
+        assert isinstance(result, VectorStoreQueryResult)
+        scope = mock_cluster.bucket.return_value.scope.return_value
+        assert scope.query.called or mock_cluster.query.called
+
+    def test_query_with_filters(self, vector_store) -> None:
+        from llama_index.core.vector_stores.types import (
+            MetadataFilter,
+            MetadataFilters,
+            VectorStoreQuery,
+            VectorStoreQueryResult,
+        )
+
+        filters = MetadataFilters(filters=[MetadataFilter(key="category", value="a")])
+        result = vector_store.query(
+            VectorStoreQuery(
+                query_embedding=[0.1, 0.2, 0.3],
+                similarity_top_k=2,
+                filters=filters,
+            )
+        )
+        assert isinstance(result, VectorStoreQueryResult)
+
+    def test_empty_query_embedding_error(self, vector_store) -> None:
+        from llama_index.core.vector_stores.types import VectorStoreQuery
+
+        with pytest.raises(ValueError):
+            vector_store.query(VectorStoreQuery(query_embedding=None))
+
+    def test_delete(self, vector_store) -> None:
+        vector_store.delete(ref_doc_id="mock-doc-1")
+
+
 @pytest.mark.skipif(
     not set_all_env_vars(), reason="missing Couchbase environment variables"
 )

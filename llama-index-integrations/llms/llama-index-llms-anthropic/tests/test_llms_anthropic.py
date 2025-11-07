@@ -648,10 +648,57 @@ def test_prepare_chat_with_tools_caching_unsupported_model(caplog):
     assert "claude-2.1" in caplog.text
 
 
-@pytest.mark.skipif(
-    os.getenv("ANTHROPIC_API_KEY") is None,
-    reason="Anthropic API key not available to test streaming metadata",
-)
+def _mock_stream_events() -> list:
+    """Build a realistic sequence of Anthropic streaming events for offline tests."""
+    from anthropic.types import (
+        Message,
+        MessageDeltaUsage,
+        RawContentBlockDeltaEvent,
+        RawContentBlockStartEvent,
+        RawContentBlockStopEvent,
+        RawMessageDeltaEvent,
+        RawMessageStartEvent,
+        RawMessageStopEvent,
+        TextDelta,
+        Usage,
+    )
+    from anthropic.types import TextBlock as AnthropicTextBlock
+    from anthropic.types.raw_message_delta_event import Delta
+
+    return [
+        RawMessageStartEvent(
+            type="message_start",
+            message=Message(
+                id="msg_test",
+                type="message",
+                role="assistant",
+                model="claude-3-5-sonnet-latest",
+                content=[],
+                stop_reason=None,
+                stop_sequence=None,
+                usage=Usage(input_tokens=12, output_tokens=1),
+            ),
+        ),
+        RawContentBlockStartEvent(
+            type="content_block_start",
+            index=0,
+            content_block=AnthropicTextBlock(type="text", text=""),
+        ),
+        RawContentBlockDeltaEvent(
+            type="content_block_delta",
+            index=0,
+            delta=TextDelta(type="text_delta", text="Hello there friend"),
+        ),
+        RawContentBlockStopEvent(type="content_block_stop", index=0),
+        RawMessageDeltaEvent(
+            type="message_delta",
+            delta=Delta(stop_reason="end_turn", stop_sequence=None),
+            usage=MessageDeltaUsage(input_tokens=12, output_tokens=5),
+        ),
+        RawMessageStopEvent(type="message_stop"),
+    ]
+
+
 def test_stream_chat_usage_and_stop_reason():
     """
     Test that streaming captures usage metadata and stop_reason from RawMessageDeltaEvent.
@@ -660,8 +707,16 @@ def test_stream_chat_usage_and_stop_reason():
     The streaming API should capture:
     - input_tokens and output_tokens from usage metadata
     - stop_reason (e.g., 'end_turn', 'max_tokens') to understand why streaming stopped
+
+    The Anthropic client is mocked so the test runs without network access.
     """
+    from unittest.mock import MagicMock
+
     llm = Anthropic(model="claude-3-5-sonnet-latest")
+    mock_client = MagicMock()
+    mock_client.messages.create.return_value = iter(_mock_stream_events())
+    llm._client = mock_client
+
     messages = [
         ChatMessage(role="user", content="Say hello in 3 words"),
     ]
@@ -693,24 +748,31 @@ def test_stream_chat_usage_and_stop_reason():
     assert stop_reason is not None, (
         "stop_reason should be captured from RawMessageDeltaEvent"
     )
-    # Typical stop reasons: "end_turn", "max_tokens", "stop_sequence", "tool_use"
     assert isinstance(stop_reason, str)
-    print(f"Stop reason: {stop_reason}")
-    print(f"Usage: {usage}")
+    assert stop_reason == "end_turn"
 
 
-@pytest.mark.skipif(
-    os.getenv("ANTHROPIC_API_KEY") is None,
-    reason="Anthropic API key not available to test async streaming metadata",
-)
 @pytest.mark.asyncio
 async def test_astream_chat_usage_and_stop_reason():
     """
     Test that async streaming captures usage metadata and stop_reason.
 
     Async version of the streaming metadata test for issue #20194.
+    The async Anthropic client is mocked so the test runs without network access.
     """
+    from unittest.mock import AsyncMock, MagicMock
+
+    events = _mock_stream_events()
+
+    async def _aiter_events():
+        for event in events:
+            yield event
+
     llm = Anthropic(model="claude-3-5-sonnet-latest")
+    mock_aclient = MagicMock()
+    mock_aclient.messages.create = AsyncMock(return_value=_aiter_events())
+    llm._aclient = mock_aclient
+
     messages = [
         ChatMessage(role="user", content="Count to 5"),
     ]
@@ -738,5 +800,4 @@ async def test_astream_chat_usage_and_stop_reason():
     stop_reason = last_chunk.message.additional_kwargs.get("stop_reason")
     assert stop_reason is not None, "stop_reason should be captured in async streaming"
     assert isinstance(stop_reason, str)
-    print(f"Async - Stop reason: {stop_reason}")
-    print(f"Async - Usage: {usage}")
+    assert stop_reason == "end_turn"

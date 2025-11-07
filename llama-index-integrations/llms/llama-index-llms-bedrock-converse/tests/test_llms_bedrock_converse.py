@@ -1073,6 +1073,193 @@ async def test_bedrock_converse_integration_system_prompt_caching_auto_write(
     assert len(str(response.message.content)) > 50, "Response should be substantial"
 
 
+def _tool_call_converse_response() -> dict:
+    return {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "toolUse": {
+                            "toolUseId": "tooluse_1",
+                            "name": "get_weather",
+                            "input": {"location": "Liverpool"},
+                        }
+                    }
+                ],
+            }
+        },
+        "stopReason": "tool_use",
+        "usage": {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15},
+        "metrics": {"latencyMs": 1},
+        "ResponseMetadata": {"RequestId": "mock-request-id", "HTTPStatusCode": 200},
+    }
+
+
+def _tool_call_stream_events() -> list:
+    return [
+        {"messageStart": {"role": "assistant"}},
+        {
+            "contentBlockStart": {
+                "contentBlockIndex": 0,
+                "start": {
+                    "toolUse": {"toolUseId": "tooluse_1", "name": "get_weather"}
+                },
+            }
+        },
+        {
+            "contentBlockDelta": {
+                "contentBlockIndex": 0,
+                "delta": {"toolUse": {"input": '{"location": "Liverpool"}'}},
+            }
+        },
+        {"contentBlockStop": {"contentBlockIndex": 0}},
+        {"messageStop": {"stopReason": "tool_use"}},
+        {
+            "metadata": {
+                "usage": {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15},
+                "metrics": {"latencyMs": 1},
+            }
+        },
+    ]
+
+
+class ToolCallMockClient:
+    def __init__(self, *args, **kwargs) -> None:
+        self.exceptions = MockExceptions()
+
+    def converse(self, *args, **kwargs):
+        return _tool_call_converse_response()
+
+    def converse_stream(self, *args, **kwargs):
+        def stream_generator():
+            yield from _tool_call_stream_events()
+
+        return {"stream": stream_generator()}
+
+
+class ToolCallAsyncMockClient:
+    def __init__(self, *args, **kwargs) -> None:
+        self.exceptions = MockExceptions()
+
+    async def __aenter__(self) -> "ToolCallAsyncMockClient":
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        pass
+
+    async def converse(self, *args, **kwargs):
+        return _tool_call_converse_response()
+
+    async def converse_stream(self, *args, **kwargs):
+        async def stream_generator():
+            for event in _tool_call_stream_events():
+                yield event
+
+        return {"stream": stream_generator()}
+
+
+class ToolCallMockAsyncSession:
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    def client(self, *args, **kwargs) -> ToolCallAsyncMockClient:
+        return ToolCallAsyncMockClient()
+
+
+def _has_expected_tool_call(blocks) -> bool:
+    return any(
+        block.tool_name == "get_weather"
+        and (
+            block.tool_kwargs == {"location": "Liverpool"}
+            or block.tool_kwargs == json.dumps({"location": "Liverpool"})
+        )
+        for block in blocks
+        if isinstance(block, ToolCallBlock)
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_call_input_output_mocked(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "boto3.Session.client", lambda *args, **kwargs: ToolCallMockClient()
+    )
+    monkeypatch.setattr("aioboto3.Session", ToolCallMockAsyncSession)
+
+    llm = BedrockConverse(
+        model=EXP_MODEL,
+        max_tokens=EXP_MAX_TOKENS,
+        temperature=EXP_TEMPERATURE,
+        region_name="us-east-1",
+    )
+
+    def get_weather(location: str):
+        return f"The weather in {location} is rainy."
+
+    tool = FunctionTool.from_defaults(
+        fn=get_weather,
+        name="get_weather",
+        description="Get the weather of a given location",
+    )
+
+    history = [
+        ChatMessage(
+            role="user",
+            content="Hello, can you tell me what is the weather today in London?",
+        ),
+        ChatMessage(
+            role="assistant",
+            blocks=[
+                ToolCallBlock(
+                    tool_name="get_weather",
+                    tool_kwargs={"location": "London"},
+                    tool_call_id="1",
+                ),
+            ],
+        ),
+        ChatMessage(
+            role=MessageRole.TOOL,
+            content="The weather in London is windy",
+            additional_kwargs={"tool_call_id": "1"},
+        ),
+        ChatMessage(
+            role="assistant",
+            blocks=[TextBlock(text="The weather in London is windy")],
+        ),
+    ]
+
+    input_message = ChatMessage(
+        role="user",
+        content="Ok, and what is the weather in Liverpool?",
+    )
+
+    response = llm.chat_with_tools(
+        tools=[tool], user_msg=input_message, chat_history=history
+    )
+    assert _has_expected_tool_call(response.message.blocks)
+
+    aresponse = await llm.achat_with_tools(
+        tools=[tool], user_msg=input_message, chat_history=history
+    )
+    assert _has_expected_tool_call(aresponse.message.blocks)
+
+    stream_response = llm.stream_chat_with_tools(
+        tools=[tool], user_msg=input_message, chat_history=history
+    )
+    blocks = []
+    for res in stream_response:
+        blocks.extend(res.message.blocks)
+    assert _has_expected_tool_call(blocks)
+
+    astream_response = await llm.astream_chat_with_tools(
+        tools=[tool], user_msg=input_message, chat_history=history
+    )
+    ablocks = []
+    async for res in astream_response:
+        ablocks.extend(res.message.blocks)
+    assert _has_expected_tool_call(ablocks)
+
+
 @needs_aws_creds
 @pytest.mark.asyncio
 async def test_tool_call_input_output(
